@@ -27,4 +27,10 @@ def get_price(symbol: str) -> float:
         The price of the stock
     """
     ticker = yf.Ticker(symbol)
-    return float(ticker.info.get("currentPrice", 0))
+    price = float(ticker.info.get("regularMarketPrice", 0))
+    if price == 0:
+        # Fallback to last close if regularMarketPrice is not available
+        hist = ticker.history(period='1d')
+        if not hist.empty:
+            price = float(hist['Close'].iloc[-1])
+    return price

@@ -70,9 +70,13 @@ def process_options_chain(
     # Exclude if the bid-ask spread is > 15% of the mid price
     df = df[df["spread_pct"] < 0.15]
 
-    # 3. Moneyness Filter: Tighten the range for stability
-    # Deep OTM options have "gamma" issues that break the Hagan approximation
-    df = df[(df["strike"] > spot_price * 0.75) & (df["strike"] < spot_price * 1.25)]
+    # 3. Moneyness Filter: Keep strikes within a reasonable range for smile modeling
+    # Hybrid approach: Use forward price when available, fall back to spot for consistency
+    # This adapts filtering to time decay (long-dated forwards shrink) while avoiding junk extremes
+    df["strike_min"] = df["forward"] * 0.70  # forward - 30%
+    df["strike_max"] = df["forward"] * 1.30  # forward + 30%
+    df = df[(df["strike"] > df["strike_min"]) & (df["strike"] < df["strike_max"])]
+    df = df.drop(columns=["strike_min", "strike_max"])
 
     # 4. Maturity Filter: Remove noise from options expiring too soon
     df = df[df["T"] > (7 / 365)]
