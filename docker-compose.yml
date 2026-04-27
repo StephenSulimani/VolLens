@@ -5,5 +5,17 @@ services:
       dockerfile: Dockerfile
     container_name: vollens-backend
     ports:
-      - "5000:5000"
+      - "8080:8080"
+    restart: unless-stopped
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vollens-frontend
+    environment:
+      VITE_API_PROXY_TARGET: http://backend:8080
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
     restart: unless-stopped
