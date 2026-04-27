@@ -1,17 +1,17 @@
-from alpaca import Option
 from datetime import datetime
 import numpy as np
 import pandas as pd
+from typing import Mapping, Any
 
 
 def process_options_chain(
-    raw_data: list[Option], spot_price: float, r: float, q: float
+    raw_data: list[Mapping[str, Any]], spot_price: float, r: float, q: float
 ) -> pd.DataFrame:
     """
     Processes the options chain and creates a dataframe
 
     Args:
-        raw_data (list[Option]): Raw options data from the Alpaca API
+        raw_data (list[Mapping[str, Any]]): Raw options data from a provider
         spot_price (float): The current price of a given stock
         r (float): The risk-free rate
         q (float): The divident yield for a given stock
