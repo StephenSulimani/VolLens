@@ -151,3 +151,82 @@ def find_vol_arbitrage_opportunities(
         ["signal_strength", "abs_iv_spread", "volume"],
         ascending=[False, False, False],
     )
+
+
+def build_consensus_signals(
+    sabr_opps: pd.DataFrame,
+    heston_opps: pd.DataFrame,
+    min_agreement_score: float = 0.04,
+) -> pd.DataFrame:
+    """
+    Join SABR and Heston opportunities by contract and keep directional agreement.
+    """
+    if sabr_opps.empty or heston_opps.empty:
+        return pd.DataFrame()
+
+    key_cols = ["expiry_date", "strike", "is_call"]
+    s = sabr_opps.copy()
+    h = heston_opps.copy()
+
+    s = s.rename(
+        columns={
+            "model_iv": "sabr_model_iv",
+            "iv_spread": "sabr_iv_spread",
+            "spread_zscore": "sabr_z",
+            "signal_strength": "sabr_signal",
+            "vol_arb_side": "sabr_side",
+        }
+    )
+    h = h.rename(
+        columns={
+            "model_iv": "heston_model_iv",
+            "iv_spread": "heston_iv_spread",
+            "spread_zscore": "heston_z",
+            "signal_strength": "heston_signal",
+            "vol_arb_side": "heston_side",
+        }
+    )
+
+    keep_s = key_cols + [
+        "mkt_iv",
+        "T",
+        "volume",
+        "sabr_model_iv",
+        "sabr_iv_spread",
+        "sabr_z",
+        "sabr_signal",
+        "sabr_side",
+    ]
+    keep_h = key_cols + [
+        "heston_model_iv",
+        "heston_iv_spread",
+        "heston_z",
+        "heston_signal",
+        "heston_side",
+    ]
+
+    merged = s[keep_s].merge(h[keep_h], on=key_cols, how="inner")
+    if merged.empty:
+        return merged
+
+    same_sign = np.sign(merged["sabr_iv_spread"]) == np.sign(merged["heston_iv_spread"])
+    merged = merged[same_sign].copy()
+    if merged.empty:
+        return merged
+
+    merged["consensus_side"] = np.where(merged["sabr_iv_spread"] > 0, "buy_vol", "sell_vol")
+    merged["consensus_spread"] = 0.5 * (merged["sabr_iv_spread"] + merged["heston_iv_spread"])
+    merged["agreement_score"] = np.sqrt(
+        np.maximum(np.abs(merged["sabr_iv_spread"] * merged["heston_iv_spread"]), 0.0)
+    ) * (
+        0.5 * (np.abs(merged["sabr_z"]) + np.abs(merged["heston_z"]))
+    )
+
+    merged = merged[merged["agreement_score"] >= min_agreement_score].copy()
+    if merged.empty:
+        return merged
+
+    return merged.sort_values(
+        ["agreement_score", "volume"],
+        ascending=[False, False],
+    ).reset_index(drop=True)

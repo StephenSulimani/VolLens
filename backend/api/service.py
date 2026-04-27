@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -12,6 +14,7 @@ from typing import Any
 import numpy as np
 
 from models import (
+    build_consensus_signals,
     calculate_heston_vols,
     calculate_sabr_vols,
     calibrate_heston,
@@ -21,6 +24,8 @@ from models import (
 )
 from utils import get_risk_free_rate, process_options_chain
 from yahoo import YahooOptions, get_dividend_yield, get_price
+
+logger = logging.getLogger("vollens.api.service")
 
 
 @dataclass
@@ -49,7 +54,7 @@ def _to_jsonable(value: Any) -> Any:
     if hasattr(value, "isoformat"):
         try:
             return value.isoformat()
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             return str(value)
     return value
 
@@ -69,6 +74,12 @@ class VolatilityAnalysisService:
         job = JobState(id=job_id, ticker=ticker)
         with self._lock:
             self._jobs[job_id] = job
+        logger.info(
+            "job_created job_id=%s ticker=%s sabr_beta=%.3f",
+            job_id,
+            ticker,
+            sabr_beta,
+        )
 
         thread = threading.Thread(
             target=self._run_job,
@@ -91,104 +102,200 @@ class VolatilityAnalysisService:
         job = self.get_job(job_id)
         if job is None:
             return
+        t0 = time.perf_counter()
         try:
             job.status = "running"
+            logger.info("job_started job_id=%s ticker=%s", job_id, ticker)
             self._push_event(job, "status", {"status": "running", "message": "Starting analysis"})
 
             spot = get_price(ticker)
             r_rate = get_risk_free_rate()
             q_yield = get_dividend_yield(ticker)
+            logger.info(
+                "market_data_ready job_id=%s spot=%.4f r=%.5f q=%.5f",
+                job_id,
+                float(spot),
+                float(r_rate),
+                float(q_yield),
+            )
             self._push_event(job, "progress", {"step": "market_data", "spot": spot})
 
             options = self._options_client.options_chain(ticker, limit=20000)
+            logger.info(
+                "options_fetched job_id=%s contracts=%d",
+                job_id,
+                len(options),
+            )
             self._push_event(job, "progress", {"step": "options_fetched", "contracts": len(options)})
 
             df = process_options_chain(options, spot, r_rate, q_yield)
+            logger.info(
+                "options_processed job_id=%s rows=%d expiries=%d",
+                job_id,
+                len(df),
+                int(df["expiry_date"].nunique()),
+            )
             self._push_event(
                 job,
                 "progress",
                 {"step": "options_processed", "rows": len(df), "expiries": int(df["expiry_date"].nunique())},
             )
 
-            sabr_params = calibrate_sabr(df, beta=sabr_beta)
-            self._push_event(job, "progress", {"step": "sabr_calibrated", "expiries": len(sabr_params)})
-
-            # Build SABR surfaces by expiry.
-            sabr_surfaces = {}
-            for expiry, params in sabr_params.items():
-                sub = df[df["expiry_date"] == expiry]
-                if sub.empty:
-                    continue
-                fwd = float(sub["forward"].iloc[0])
-                ttm = float(sub["T"].iloc[0])
-                sabr_surfaces[str(expiry)] = get_theoretical_smile(
-                    fwd,
-                    ttm,
-                    float(params["atm_vol"]),
-                    float(params["rho"]),
-                    float(params["volvol"]),
-                    beta=sabr_beta,
-                    alpha=params.get("alpha"),
+            def compute_sabr():
+                sabr_params = calibrate_sabr(df, beta=sabr_beta)
+                sabr_surfaces = {}
+                for expiry, params in sabr_params.items():
+                    sub = df[df["expiry_date"] == expiry]
+                    if sub.empty:
+                        continue
+                    fwd = float(sub["forward"].iloc[0])
+                    ttm = float(sub["T"].iloc[0])
+                    sabr_surfaces[str(expiry)] = get_theoretical_smile(
+                        fwd,
+                        ttm,
+                        float(params["atm_vol"]),
+                        float(params["rho"]),
+                        float(params["volvol"]),
+                        beta=sabr_beta,
+                        alpha=params.get("alpha"),
+                    )
+                sabr_model_vols = calculate_sabr_vols(df, sabr_params, beta=sabr_beta)
+                sabr_quality_by_expiry = {
+                    expiry: {"rmse": p.get("rmse", np.nan), "status": p.get("status", "unknown")}
+                    for expiry, p in sabr_params.items()
+                }
+                sabr_opps = find_vol_arbitrage_opportunities(
+                    df,
+                    sabr_model_vols,
+                    "SABR",
+                    min_abs_spread=0.015,
+                    zscore_threshold=1.4,
+                    model_quality_by_expiry=sabr_quality_by_expiry,
+                    max_fit_rmse=0.06,
+                    allowed_statuses={"ok"},
+                    min_volume=30,
+                    max_spread_pct=0.10,
                 )
+                return sabr_params, sabr_surfaces, sabr_opps
 
-            heston_params = calibrate_heston(df, spot, r_rate, q_yield)
-            self._push_event(job, "progress", {"step": "heston_calibrated"})
-
-            # Heston surfaces by expiry using same strikes as market chain.
-            heston_surfaces = {}
-            heston_params_arr = np.array(heston_params, dtype=float)
-            for expiry, sub in df.groupby("expiry_date"):
-                model_vols = calculate_heston_vols(sub, spot, r_rate, q_yield, heston_params_arr)
-                heston_surfaces[str(expiry)] = [
-                    {
-                        "strike": float(k),
-                        "vol": float(v),
+            def compute_heston():
+                heston_params = calibrate_heston(df, spot, r_rate, q_yield)
+                heston_params_arr = np.array(heston_params, dtype=float)
+                heston_surfaces = {}
+                for expiry, sub in df.groupby("expiry_date"):
+                    model_vols = calculate_heston_vols(sub, spot, r_rate, q_yield, heston_params_arr)
+                    heston_surfaces[str(expiry)] = [
+                        {
+                            "strike": float(k),
+                            "vol": float(v),
+                        }
+                        for k, v in zip(sub["strike"].to_numpy(), model_vols)
+                        if np.isfinite(v) and v > 0
+                    ]
+                heston_model_vols = calculate_heston_vols(df, spot, r_rate, q_yield, heston_params_arr)
+                heston_eval = df.copy()
+                heston_eval["model_iv"] = heston_model_vols
+                heston_eval = heston_eval[np.isfinite(heston_eval["model_iv"]) & (heston_eval["model_iv"] > 0)]
+                heston_quality_by_expiry = {}
+                for expiry, g in heston_eval.groupby("expiry_date"):
+                    rmse = float(np.sqrt(np.mean((g["model_iv"] - g["mkt_iv"]) ** 2)))
+                    heston_quality_by_expiry[expiry] = {
+                        "rmse": rmse,
+                        "status": "ok" if rmse <= 0.08 else "weak_fit",
                     }
-                    for k, v in zip(sub["strike"].to_numpy(), model_vols)
-                    if np.isfinite(v) and v > 0
-                ]
+                heston_opps = find_vol_arbitrage_opportunities(
+                    df,
+                    heston_model_vols,
+                    "Heston",
+                    min_abs_spread=0.015,
+                    zscore_threshold=1.4,
+                    model_quality_by_expiry=heston_quality_by_expiry,
+                    max_fit_rmse=0.08,
+                    allowed_statuses={"ok"},
+                    min_volume=30,
+                    max_spread_pct=0.10,
+                )
+                return heston_params_arr, heston_surfaces, heston_opps
 
-            sabr_model_vols = calculate_sabr_vols(df, sabr_params, beta=sabr_beta)
-            heston_model_vols = calculate_heston_vols(df, spot, r_rate, q_yield, heston_params_arr)
+            sabr_params = {}
+            sabr_surfaces = {}
+            sabr_opps = None
+            heston_params_arr = np.array([np.nan, np.nan, np.nan, np.nan, np.nan], dtype=float)
+            heston_surfaces = {}
+            heston_opps = None
 
-            sabr_quality_by_expiry = {
-                expiry: {"rmse": p.get("rmse", np.nan), "status": p.get("status", "unknown")}
-                for expiry, p in sabr_params.items()
-            }
-            heston_eval = df.copy()
-            heston_eval["model_iv"] = heston_model_vols
-            heston_eval = heston_eval[np.isfinite(heston_eval["model_iv"]) & (heston_eval["model_iv"] > 0)]
-            heston_quality_by_expiry = {}
-            for expiry, g in heston_eval.groupby("expiry_date"):
-                rmse = float(np.sqrt(np.mean((g["model_iv"] - g["mkt_iv"]) ** 2)))
-                heston_quality_by_expiry[expiry] = {
-                    "rmse": rmse,
-                    "status": "ok" if rmse <= 0.08 else "weak_fit",
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                future_map = {
+                    pool.submit(compute_sabr): "sabr",
+                    pool.submit(compute_heston): "heston",
                 }
 
-            sabr_opps = find_vol_arbitrage_opportunities(
-                df,
-                sabr_model_vols,
-                "SABR",
-                min_abs_spread=0.015,
-                zscore_threshold=1.4,
-                model_quality_by_expiry=sabr_quality_by_expiry,
-                max_fit_rmse=0.06,
-                allowed_statuses={"ok"},
-                min_volume=30,
-                max_spread_pct=0.10,
-            )
-            heston_opps = find_vol_arbitrage_opportunities(
-                df,
-                heston_model_vols,
-                "Heston",
-                min_abs_spread=0.015,
-                zscore_threshold=1.4,
-                model_quality_by_expiry=heston_quality_by_expiry,
-                max_fit_rmse=0.08,
-                allowed_statuses={"ok"},
-                min_volume=30,
-                max_spread_pct=0.10,
+                for future in as_completed(future_map):
+                    model_name = future_map[future]
+                    if model_name == "sabr":
+                        sabr_params, sabr_surfaces, sabr_opps = future.result()
+                        logger.info(
+                            "sabr_ready job_id=%s expiries=%d opps=%d",
+                            job_id,
+                            len(sabr_params),
+                            len(sabr_opps),
+                        )
+                        self._push_event(
+                            job,
+                            "sabr_ready",
+                            {
+                                "step": "sabr_ready",
+                                "sabr": _to_jsonable(
+                                    {
+                                        "beta": float(sabr_beta),
+                                        "params_by_expiry": sabr_params,
+                                        "surface_by_expiry": sabr_surfaces,
+                                        "opportunities": sabr_opps.head(100).to_dict(orient="records"),
+                                    }
+                                ),
+                            },
+                        )
+                    else:
+                        heston_params_arr, heston_surfaces, heston_opps = future.result()
+                        logger.info(
+                            "heston_ready job_id=%s expiries=%d opps=%d params=[%.4f,%.4f,%.4f,%.4f,%.4f]",
+                            job_id,
+                            len(heston_surfaces),
+                            len(heston_opps),
+                            float(heston_params_arr[0]),
+                            float(heston_params_arr[1]),
+                            float(heston_params_arr[2]),
+                            float(heston_params_arr[3]),
+                            float(heston_params_arr[4]),
+                        )
+                        self._push_event(
+                            job,
+                            "heston_ready",
+                            {
+                                "step": "heston_ready",
+                                "heston": _to_jsonable(
+                                    {
+                                        "params": {
+                                            "kappa": float(heston_params_arr[0]),
+                                            "theta": float(heston_params_arr[1]),
+                                            "sigma": float(heston_params_arr[2]),
+                                            "rho": float(heston_params_arr[3]),
+                                            "v0": float(heston_params_arr[4]),
+                                        },
+                                        "surface_by_expiry": heston_surfaces,
+                                        "opportunities": heston_opps.head(100).to_dict(orient="records"),
+                                    }
+                                ),
+                            },
+                        )
+
+            if sabr_opps is None or heston_opps is None:
+                raise RuntimeError("Model computation did not complete for both SABR and Heston.")
+            consensus = build_consensus_signals(sabr_opps, heston_opps)
+            logger.info(
+                "consensus_ready job_id=%s signals=%d",
+                job_id,
+                len(consensus),
             )
 
             result = {
@@ -219,9 +326,22 @@ class VolatilityAnalysisService:
                         heston_opps.head(100).to_dict(orient="records")
                     ),
                 },
+                "consensus": {
+                    "signals": _to_jsonable(consensus.head(100).to_dict(orient="records")),
+                },
             }
             job.result = result
             job.status = "completed"
+            elapsed = time.perf_counter() - t0
+            logger.info(
+                "job_completed job_id=%s ticker=%s elapsed_s=%.2f sabr_opps=%d heston_opps=%d consensus=%d",
+                job_id,
+                ticker,
+                elapsed,
+                int(len(sabr_opps)),
+                int(len(heston_opps)),
+                int(len(consensus)),
+            )
             self._push_event(
                 job,
                 "completed",
@@ -230,12 +350,21 @@ class VolatilityAnalysisService:
                     "summary": {
                         "sabr_opportunities": int(len(sabr_opps)),
                         "heston_opportunities": int(len(heston_opps)),
+                        "consensus_signals": int(len(consensus)),
                     },
                 },
             )
-        except Exception as exc:
+        except (RuntimeError, ValueError, TypeError) as exc:
             job.status = "failed"
             job.error = str(exc)
+            elapsed = time.perf_counter() - t0
+            logger.exception(
+                "job_failed job_id=%s ticker=%s elapsed_s=%.2f error=%s",
+                job_id,
+                ticker,
+                elapsed,
+                str(exc),
+            )
             self._push_event(
                 job,
                 "error",

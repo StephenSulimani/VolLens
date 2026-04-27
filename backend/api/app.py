@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import json
+import logging
+import queue
 import time
 
 from flask import Flask, Response, jsonify, request
@@ -9,6 +10,11 @@ from .service import VolatilityAnalysisService
 
 
 def create_app() -> Flask:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
+    logger = logging.getLogger("vollens.api.app")
     app = Flask(__name__)
     service = VolatilityAnalysisService()
 
@@ -28,6 +34,12 @@ def create_app() -> Flask:
             job_id = service.start_job(ticker=ticker, sabr_beta=sabr_beta)
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
+        logger.info(
+            "analyze_requested ticker=%s sabr_beta=%.3f job_id=%s",
+            ticker.strip().upper(),
+            sabr_beta,
+            job_id,
+        )
         return jsonify({"job_id": job_id}), 202
 
     @app.get("/api/jobs/<job_id>")
@@ -62,6 +74,7 @@ def create_app() -> Flask:
         job = service.get_job(job_id)
         if job is None:
             return jsonify({"error": "job not found"}), 404
+        logger.info("stream_connected job_id=%s", job_id)
 
         def generate():
             # Initial handshake event.
@@ -87,12 +100,13 @@ def create_app() -> Flask:
                         }
                         yield service.event_to_sse(tail)
                         break
-                except Exception:
+                except queue.Empty:
                     # Keep-alive for proxies/browsers.
                     yield ": keep-alive\n\n"
                     if job.status in {"completed", "failed"}:
                         break
                 time.sleep(0.01)
+            logger.info("stream_disconnected job_id=%s status=%s", job_id, job.status)
 
         return Response(
             generate(),
@@ -109,4 +123,4 @@ def create_app() -> Flask:
 
 if __name__ == "__main__":
     app = create_app()
-    app.run(host="0.0.0.0", port=5000, debug=True, threaded=True)
+    app.run(host="0.0.0.0", port=8080, debug=True, threaded=True)
