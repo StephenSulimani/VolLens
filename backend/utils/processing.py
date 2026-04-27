@@ -64,26 +64,30 @@ def process_options_chain(
 
     # 1. Hard Volatility Filter: Remove negative or extremely low IV
     df = df[df["mkt_iv"] > 0.005]  # 0.5% minimum IV
+    df = df[df["mid_price"] > 0.05]
 
-    # 2. Liquidity Filter: Only keep OTM options (Standard for Vol Surfaces)
-    df = df[
-        ((df["is_call"]) & (df["strike"] > spot_price))
-        | ((~df["is_call"]) & (df["strike"] < spot_price))
-    ]
-
-    # 3. Spread Filter: High spreads = unreliable IVs (Arb signal noise)
+    # 2. Spread Filter: High spreads = unreliable IVs (Arb signal noise)
     # Exclude if the bid-ask spread is > 15% of the mid price
     df = df[df["spread_pct"] < 0.15]
 
-    # 4. Moneyness Filter: Tighten the range for stability
+    # 3. Moneyness Filter: Tighten the range for stability
     # Deep OTM options have "gamma" issues that break the Hagan approximation
     df = df[(df["strike"] > spot_price * 0.75) & (df["strike"] < spot_price * 1.25)]
 
-    # 5. Maturity Filter: Remove noise from options expiring too soon
+    # 4. Maturity Filter: Remove noise from options expiring too soon
     df = df[df["T"] > (7 / 365)]
 
-    # 6. Group Validity Filter: Ensure we have enough points to actually fit a smile
+    # 5. Keep one high-quality quote per strike/expiry (avoid call+put double-counting).
+    df["quality_rank"] = np.sqrt(df["volume"] + 1.0) / np.maximum(df["spread_pct"], 0.005)
+    df = (
+        df.sort_values(["expiry_date", "strike", "quality_rank"], ascending=[True, True, False])
+        .groupby(["expiry_date", "strike"], as_index=False)
+        .first()
+    )
+    df = df.drop(columns=["quality_rank"])
+
+    # 6. Group Validity Filter: Ensure we have enough points to fit a smile
     # A SABR smile needs at least 5 points to be meaningful
-    # df = df.groupby("expiry_date").filter(lambda x: len(x) >= 5)
+    df = df.groupby("expiry_date").filter(lambda x: len(x) >= 5)
 
     return df

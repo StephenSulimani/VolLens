@@ -53,6 +53,7 @@ class YahooOptions:
                     last = float(row.get("lastPrice", 0.0) or 0.0)
                     iv = float(row.get("impliedVolatility", 0.0) or 0.0)
                     volume = float(row.get("volume", 0.0) or 0.0)
+                    open_interest = float(row.get("openInterest", 0.0) or 0.0)
                     strike = float(row.get("strike", 0.0) or 0.0)
 
                     # When bid/ask are missing, fallback to last trade.
@@ -61,7 +62,11 @@ class YahooOptions:
                         spread = max(0.0, ask - bid)
                     else:
                         mid = max(0.0, last)
-                        spread = 0.0
+                        # Mark missing quotes as wide to be filtered downstream.
+                        spread = max(mid, 1.0)
+
+                    if mid <= 0 or strike <= 0 or iv <= 0:
+                        continue
 
                     option: Option = {
                         "Price": {
@@ -73,7 +78,7 @@ class YahooOptions:
                         "Type": opt_type,
                         "Expiry": expiry_dt,
                         "ImpliedVol": iv,
-                        "Volume": volume,
+                        "Volume": max(volume, open_interest),
                         "Strike": strike,
                         "Delta": 0.0,
                         "Gamma": 0.0,
