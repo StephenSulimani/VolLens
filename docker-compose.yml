@@ -1,0 +1,9 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vollens-backend
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
