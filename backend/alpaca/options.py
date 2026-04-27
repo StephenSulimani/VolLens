@@ -13,6 +13,7 @@ class OptionType(Enum):
 class OptionPrice(TypedDict):
     AskPrice: float
     BidPrice: float
+    MidPrice: float
     Spread: float
 
 
@@ -21,6 +22,7 @@ class Option(TypedDict):
     Type: OptionType
     Expiry: datetime
     ImpliedVol: float
+    Volume: float
     Strike: float
     Delta: float
     Gamma: float
@@ -98,6 +100,7 @@ class AlpacaOptions(Alpaca):
                     "AskPrice": option["ap"],
                     "BidPrice": option["bp"],
                     "Spread": option["ap"] - option["bp"],
+                    "MidPrice": (option["ap"] + option["bp"]) / 2,
                 }
                 option_prices.append(price)
             except KeyError:
@@ -142,12 +145,23 @@ class AlpacaOptions(Alpaca):
                 parsed_osi = self._parse_osi(osi)
 
                 try:
-                    parsed_option: Option = {
+                    option_price: OptionPrice = {
                         "AskPrice": option["latestQuote"]["ap"],
                         "BidPrice": option["latestQuote"]["bp"],
+                        "Spread": option["latestQuote"]["ap"]
+                        - option["latestQuote"]["bp"],
+                        "MidPrice": (
+                            option["latestQuote"]["ap"] + option["latestQuote"]["bp"]
+                        )
+                        / 2,
+                    }
+
+                    parsed_option: Option = {
+                        "Price": option_price,
                         "Type": parsed_osi["type"],
                         "Expiry": parsed_osi["expiry"],
                         "ImpliedVol": option["impliedVolatility"],
+                        "Volume": option["dailyBar"]["v"],
                         "Strike": parsed_osi["strike"],
                         "Delta": option["greeks"]["delta"],
                         "Gamma": option["greeks"]["gamma"],
