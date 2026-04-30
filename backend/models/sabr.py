@@ -45,7 +45,17 @@ def calibrate_sabr(df: pd.DataFrame, beta=0.5):
         f = float(smile["forward"].iloc[0])
         t = float(smile["T"].iloc[0])
         smile["log_mny"] = np.abs(np.log(smile["strike"] / f))
-        smile = smile[smile["log_mny"] < 0.23]  # roughly [0.79F, 1.26F]
+        
+        # Adaptive moneyness filter based on time to maturity.
+        # Longer-dated options have data concentrated further OTM.
+        if t > 0.5:  # 6+ months
+            mon_threshold = 0.40  # ±40%
+        elif t > 0.25:  # 3+ months
+            mon_threshold = 0.35  # ±35%
+        else:
+            mon_threshold = 0.23  # ±23% for short-dated
+        
+        smile = smile[smile["log_mny"] < mon_threshold]
         if len(smile) < 5:
             continue
         # Use a stable core subset around forward to reduce short-dated noise.
@@ -107,10 +117,10 @@ def calibrate_sabr(df: pd.DataFrame, beta=0.5):
 
         # First pass: use pysabr native fit (alpha, rho, volvol), then bounded polish.
         fit_guesses = [
-            [max(0.01, atm_vol), -0.30, 0.35],
-            [max(0.01, atm_vol), -0.60, 0.80],
-            [max(0.01, atm_vol), 0.00, 0.25],
-            [max(0.01, atm_vol), 0.30, 0.60],
+            [max(1e-4, alpha_anchor), -0.30, 0.35],
+            [max(1e-4, alpha_anchor), -0.60, 0.80],
+            [max(1e-4, alpha_anchor), 0.00, 0.25],
+            [max(1e-4, alpha_anchor), 0.30, 0.60],
         ]
         best_tuple = None
         best_err = np.inf
@@ -120,12 +130,12 @@ def calibrate_sabr(df: pd.DataFrame, beta=0.5):
                     f=f, t=t, shift=0, beta=beta, v_atm_n=atm_vol, rho=0.0, volvol=0.2
                 )
                 alpha, rho_fit, volvol_fit = sabr_fit.fit(
-                    strikes.astype(float), market_vols.astype(float) * 100.0, initial_guess=guess
+                    strikes.astype(float), market_vols.astype(float) / 100.0, initial_guess=guess
                 )
                 if not np.isfinite(alpha) or not np.isfinite(rho_fit) or not np.isfinite(volvol_fit):
                     continue
                 # Re-score on our weighted objective.
-                err = objective([float(rho_fit), float(volvol_fit)])
+                err = objective([float(alpha), float(rho_fit), float(volvol_fit)])
                 if np.isfinite(err) and err < best_err:
                     best_err = err
                     best_tuple = (float(alpha), float(rho_fit), float(volvol_fit))
