@@ -186,23 +186,46 @@ def calibrate_sabr(df: pd.DataFrame, beta=0.5):
                 final_obj = float(best_err)
 
         if np.isfinite(alpha) and np.isfinite(rho) and np.isfinite(volvol):
+            # Detect boundary conditions
+            alpha_at_lower_bound = np.isclose(alpha, bounds[0][0], atol=1e-5)
+            alpha_at_upper_bound = np.isclose(alpha, bounds[0][1], atol=1e-3)
+            volvol_at_lower_bound = np.isclose(volvol, bounds[2][0], atol=1e-4)
+            volvol_at_upper_bound = np.isclose(volvol, bounds[2][1], atol=1e-3)
+            rho_extreme = abs(rho) > 0.97
+            
             boundary_hit = (
-                np.isclose(volvol, bounds[2][1], atol=1e-3)
-                or np.isclose(volvol, bounds[2][0], atol=1e-4)
-                or abs(rho) > 0.97
+                alpha_at_lower_bound
+                or alpha_at_upper_bound
+                or volvol_at_lower_bound
+                or volvol_at_upper_bound
+                or rho_extreme
             )
+            
             model_vols = np.array(
                 [hagan_lognormal_vol(float(k), f, t, alpha, beta, rho, volvol) for k in strikes]
             )
+            
+            # Sanity check: reject if model vols are unrealistically low (<0.5%) or too high (>200%)
+            model_vol_median = np.median(model_vols)
+            vol_sanity_fail = model_vol_median < 0.005 or model_vol_median > 2.0
+            
             rmse = float(np.sqrt(np.mean((model_vols - market_vols) ** 2)))
+            
+            # Flag degenerate fits
+            degenerate_status = "degenerate_fit" if vol_sanity_fail else (
+                "boundary_hit" if boundary_hit else "ok"
+            )
+            
             calibrated_params[expiry] = {
                 "rho": float(rho),
                 "volvol": float(volvol),
                 "atm_vol": float(atm_vol),
                 "alpha": float(alpha),
-                "status": "boundary_hit" if boundary_hit else "ok",
+                "status": degenerate_status,
                 "rmse": rmse,
                 "objective": final_obj,
+                "alpha_at_lower_bound": alpha_at_lower_bound,
+                "model_vol_median": float(model_vol_median),
             }
 
     return calibrated_params

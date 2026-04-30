@@ -19,6 +19,10 @@ def calculate_sabr_vols(
         params = calibrated_params.get(expiry)
         if not params:
             continue
+        
+        # Skip degenerate fits
+        if params.get("status") == "degenerate_fit":
+            continue
 
         f = float(row["forward"])
         t = float(row["T"])

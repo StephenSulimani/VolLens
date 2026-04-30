@@ -145,6 +145,16 @@ class VolatilityAnalysisService:
                 sabr_params = calibrate_sabr(df, beta=sabr_beta)
                 sabr_surfaces = {}
                 for expiry, params in sabr_params.items():
+                    # Skip degenerate fits (unrealistic volatility surfaces)
+                    if params.get("status") == "degenerate_fit":
+                        logger.warning(
+                            "Skipping degenerate SABR fit for %s: median_vol=%.6f, alpha_at_bound=%s",
+                            expiry,
+                            params.get("model_vol_median", np.nan),
+                            params.get("alpha_at_lower_bound", False),
+                        )
+                        continue
+                    
                     sub = df[df["expiry_date"] == expiry]
                     if sub.empty:
                         continue
